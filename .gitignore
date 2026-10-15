@@ -21,14 +21,18 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+run-logs/
 
 # Local configuration and secrets
 .env
 .env.*
 !.env.example
+.azure/
+azure.yaml
 
 # Editors and operating systems
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+.azure

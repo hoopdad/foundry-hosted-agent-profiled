@@ -1,26 +1,196 @@
 print("STARTUP", flush=True)
 
+from collections import OrderedDict
 import json
 import itertools
 import os
-import sys
 import time
 import uuid
 import tempfile
-import subprocess
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from azure.ai.agentserver.invocations import InvocationAgentServerHost
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.core.pipeline.policies import SansIOHTTPPolicy
 from azure.storage.blob import BlobClient, ContentSettings
 from azure.identity import ManagedIdentityCredential
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import socket
+import urllib3.util.connection as urllib3_connection
 
-app = InvocationAgentServerHost()
+_original_getaddrinfo = socket.getaddrinfo
+_original_create_connection = urllib3_connection.create_connection
+
+
+def _profiled_getaddrinfo(host, *args, **kwargs):
+    started = time.perf_counter()
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+    try:
+        result = _original_getaddrinfo(host, *args, **kwargs)
+        duration_ms = (time.perf_counter() - started) * 1000
+
+        addresses = sorted({
+            item[4][0]
+            for item in result
+            if item and len(item) > 4 and item[4]
+        })
+
+        print(
+            f"DNS_PROFILE timestamp={timestamp} "
+            f"host={host} duration_ms={duration_ms:.2f} "
+            f"addresses={addresses}",
+            flush=True,
+        )
+
+        return result
+
+    except Exception as ex:
+        duration_ms = (time.perf_counter() - started) * 1000
+
+        print(
+            f"DNS_PROFILE exception timestamp={timestamp} "
+            f"host={host} duration_ms={duration_ms:.2f} "
+            f"error={type(ex).__name__}",
+            flush=True,
+        )
+
+        raise
+
+
+def _profiled_create_connection(address, *args, **kwargs):
+    started = time.perf_counter()
+    host, port = address
+
+    try:
+        result = _original_create_connection(address, *args, **kwargs)
+        duration_ms = (time.perf_counter() - started) * 1000
+
+        print(
+            f"CONNECT_PROFILE "
+            f"timestamp={datetime.now(timezone.utc).isoformat(timespec='milliseconds')} "
+            f"host={host} port={port} duration_ms={duration_ms:.2f}",
+            flush=True,
+        )
+
+        return result
+
+    except Exception as ex:
+        duration_ms = (time.perf_counter() - started) * 1000
+
+        print(
+            f"CONNECT_PROFILE exception "
+            f"timestamp={datetime.now(timezone.utc).isoformat(timespec='milliseconds')} "
+            f"host={host} port={port} duration_ms={duration_ms:.2f} "
+            f"error={type(ex).__name__}",
+            flush=True,
+        )
+
+        raise
+
+
+socket.getaddrinfo = _profiled_getaddrinfo
+urllib3_connection.create_connection = _profiled_create_connection
+
+
+MAX_RETAINED_INVOCATION_RESULTS = 100
+INVOCATIONS_OPENAPI_SPEC = {
+    "openapi": "3.1.0",
+    "info": {
+        "title": "Foundry Hosted Storage Probe",
+        "version": "1.0.0",
+    },
+    "paths": {
+        "/invocations": {
+            "post": {
+                "operationId": "invokeStorageProbe",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": [
+                                    "input_blob_path",
+                                    "output_blob_path",
+                                ],
+                                "properties": {
+                                    "input_blob_path": {
+                                        "type": "string",
+                                        "format": "uri",
+                                    },
+                                    "output_blob_path": {
+                                        "type": "string",
+                                        "format": "uri",
+                                    },
+                                    "managed_identity_client_id": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "Storage probe result.",
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"}
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/invocations/{invocation_id}": {
+            "get": {
+                "operationId": "getStorageProbeResult",
+                "parameters": [
+                    {
+                        "name": "invocation_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Retained storage probe result.",
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"}
+                            }
+                        },
+                    },
+                    "404": {
+                        "description": "Invocation result is not retained."
+                    },
+                },
+            }
+        },
+    },
+}
+_invocation_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+
+
+def _retain_invocation_result(
+    invocation_id: str,
+    response: Dict[str, Any],
+) -> None:
+    _invocation_results[invocation_id] = response
+    _invocation_results.move_to_end(invocation_id)
+
+    while len(_invocation_results) > MAX_RETAINED_INVOCATION_RESULTS:
+        _invocation_results.popitem(last=False)
+
+
+app = InvocationAgentServerHost(openapi_spec=INVOCATIONS_OPENAPI_SPEC)
 
 
 class RequestResponseProfilerPolicy(SansIOHTTPPolicy):
@@ -91,9 +261,7 @@ class RequestResponseProfilerPolicy(SansIOHTTPPolicy):
 #
 # {
 #   "input_blob_path": "https://<account>.blob.core.windows.net/<container>/<input-file>",
-#   "script_blob_path": "https://<account>.blob.core.windows.net/<container>/<script-file>.py",
-#   "output_blob_path": "https://<account>.blob.core.windows.net/<container>/<output-file>",
-#   "timeout_seconds": 120
+#   "output_blob_path": "https://<account>.blob.core.windows.net/<container>/<output-file>"
 # }
 #
 # Optional:
@@ -119,7 +287,6 @@ def get_credential(payload: Dict[str, Any]) -> ManagedIdentityCredential:
     credential = ManagedIdentityCredential(**client_options)
     credential.get_token("https://storage.azure.com/.default")
 
-
     return credential
 
 
@@ -139,8 +306,20 @@ def download_blob_to_file(blob_url: str, local_path: str, credential: ManagedIde
         _additional_pipeline_policies=[RequestResponseProfilerPolicy()],
     )
 
-    stream = blob_client.download_blob()
-    content = stream.readall()
+    try:
+        content = blob_client.download_blob().readall()
+    except ResourceNotFoundError:
+        try:
+            blob_client.upload_blob(data=b"", overwrite=False)
+            print(
+                "STORAGE_PROBE created_missing_input_blob "
+                f"url={RequestResponseProfilerPolicy._safe_url(blob_url)}",
+                flush=True,
+            )
+        except ResourceExistsError:
+            pass
+
+        content = blob_client.download_blob().readall()
 
     with open(local_path, "wb") as file:
         file.write(content)
@@ -192,7 +371,6 @@ def extract_payload(request_json: Dict[str, Any]) -> Dict[str, Any]:
     Direct:
       {
         "input_blob_path": "...",
-        "script_blob_path": "...",
         "output_blob_path": "..."
       }
 
@@ -200,7 +378,6 @@ def extract_payload(request_json: Dict[str, Any]) -> Dict[str, Any]:
       {
         "input": {
           "input_blob_path": "...",
-          "script_blob_path": "...",
           "output_blob_path": "..."
         }
       }
@@ -211,7 +388,7 @@ def extract_payload(request_json: Dict[str, Any]) -> Dict[str, Any]:
       }
     """
 
-    if all(key in request_json for key in ["input_blob_path", "script_blob_path", "output_blob_path"]):
+    if all(key in request_json for key in ["input_blob_path", "output_blob_path"]):
         return request_json
 
     input_value = request_json.get("input")
@@ -228,39 +405,8 @@ def extract_payload(request_json: Dict[str, Any]) -> Dict[str, Any]:
             pass
 
     raise ValueError(
-        "Request must include input_blob_path, script_blob_path, and output_blob_path "
+        "Request must include input_blob_path and output_blob_path "
         "either at the top level or inside an input object."
-    )
-
-
-def run_downloaded_python_script(
-    script_path: str,
-    input_path: str,
-    output_path: str,
-    working_dir: str,
-    timeout_seconds: int
-) -> subprocess.CompletedProcess:
-    """
-    Contract for the downloaded script:
-
-    The downloaded script is executed as:
-
-      python downloaded_script.py <input_file_path> <output_file_path>
-
-    Preferred behavior:
-      The downloaded script reads sys.argv[1] and writes its file result to sys.argv[2].
-
-    Fallback behavior:
-      If the script does not write sys.argv[2], this host uploads stdout instead.
-    """
-
-    return subprocess.run(
-        [sys.executable, script_path, input_path, output_path],
-        cwd=working_dir,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-        check=False
     )
 
 
@@ -289,31 +435,51 @@ def build_response(
     return body
 
 
+@app.get_invocation_handler
+async def get_invocation(request: Request):
+    invocation_id = request.path_params["invocation_id"]
+    response = _invocation_results.get(invocation_id)
+
+    if response is None:
+        return JSONResponse(
+            {
+                "error": {
+                    "code": "not_found",
+                    "message": "Invocation result is not retained.",
+                }
+            },
+            status_code=404,
+        )
+
+    _invocation_results.move_to_end(invocation_id)
+    return JSONResponse(response)
+
+
 @app.invoke_handler
 async def invoke(request: Request):
     print("***** INVOKE HANDLER EXECUTED *****", flush=True)
 
     raw_body = await request.body()
-    print(f"REQUEST BODY: {raw_body}", flush=True)
+    print(f"REQUEST BODY BYTES: {len(raw_body)}", flush=True)
+    invocation_id = request.state.invocation_id
 
     try:
         request_json = json.loads(raw_body.decode("utf-8")) if raw_body else {}
         payload = extract_payload(request_json)
 
         input_blob_path = get_required_string(payload, "input_blob_path")
-        script_blob_path = get_required_string(payload, "script_blob_path")
         output_blob_path = get_required_string(payload, "output_blob_path")
 
-        timeout_seconds = int(payload.get("timeout_seconds", 120))
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be greater than zero")
+        if input_blob_path == output_blob_path:
+            raise ValueError(
+                "input_blob_path and output_blob_path must be different"
+            )
 
         credential = get_credential(payload)
 
-        with tempfile.TemporaryDirectory(prefix="foundry_script_exec_") as work_dir:
+        with tempfile.TemporaryDirectory(prefix="foundry_storage_probe_") as work_dir:
             input_file_path = os.path.join(work_dir, "input_file")
-            script_file_path = os.path.join(work_dir, "script_to_run.py")
-            output_file_path = os.path.join(work_dir, "output_file")
+            output_file_path = os.path.join(work_dir, "storage_probe_result.json")
 
             input_bytes = download_blob_to_file(
                 blob_url=input_blob_path,
@@ -321,84 +487,46 @@ async def invoke(request: Request):
                 credential=credential
             )
 
-            script_bytes = download_blob_to_file(
-                blob_url=script_blob_path,
-                local_path=script_file_path,
-                credential=credential
+            result_document = {
+                "status": "completed",
+                "message": "Storage read/write simulation completed.",
+                "input_bytes_read": input_bytes,
+                "downloaded_code_execution_enabled": False,
+            }
+            write_text_to_file(
+                output_file_path,
+                json.dumps(result_document, indent=2, sort_keys=True)
             )
 
-            result = run_downloaded_python_script(
-                script_path=script_file_path,
-                input_path=input_file_path,
-                output_path=output_file_path,
-                working_dir=work_dir,
-                timeout_seconds=timeout_seconds
+            uploaded_bytes = upload_file_to_blob(
+                local_path=output_file_path,
+                blob_url=output_blob_path,
+                credential=credential,
+                content_type="application/json"
             )
-
-            if result.returncode != 0:
-                error_text = (
-                    "Downloaded script failed.\n\n"
-                    f"Return code: {result.returncode}\n\n"
-                    f"STDOUT:\n{result.stdout}\n\n"
-                    f"STDERR:\n{result.stderr}"
-                )
-
-                response = build_response(
-                    status="failed",
-                    content=error_text,
-                    response_id="resp_script_failed",
-                    extra={
-                        "input_bytes_downloaded": input_bytes,
-                        "script_bytes_downloaded": script_bytes
-                    }
-                )
-
-                print(f"RESPONSE: {response}", flush=True)
-                return JSONResponse(response)
-
-            if os.path.exists(output_file_path) and os.path.getsize(output_file_path) > 0:
-                uploaded_bytes = upload_file_to_blob(
-                    local_path=output_file_path,
-                    blob_url=output_blob_path,
-                    credential=credential,
-                    content_type="application/octet-stream"
-                )
-
-                output_source = "script output file"
-            else:
-                uploaded_bytes = write_text_to_file(output_file_path, result.stdout)
-
-                upload_file_to_blob(
-                    local_path=output_file_path,
-                    blob_url=output_blob_path,
-                    credential=credential,
-                    content_type="text/plain; charset=utf-8"
-                )
-
-                output_source = "script stdout"
 
             response = build_response(
                 status="completed",
                 content=(
-                    "Script execution completed successfully. "
-                    f"Uploaded {uploaded_bytes} bytes to the output blob."
+                    "Storage read/write simulation completed successfully. "
+                    "Downloaded code execution is disabled."
                 ),
-                response_id="resp_script_completed",
+                response_id=invocation_id,
                 extra={
                     "input_bytes_downloaded": input_bytes,
-                    "script_bytes_downloaded": script_bytes,
                     "uploaded_bytes": uploaded_bytes,
-                    "output_source": output_source
+                    "downloaded_code_execution_enabled": False,
                 }
             )
 
     except Exception as ex:
         response = build_response(
             status="failed",
-            content=f"Error executing script from blob storage: {str(ex)}",
-            response_id="resp_error"
+            content=f"Error during storage read/write simulation: {str(ex)}",
+            response_id=invocation_id,
         )
 
+    _retain_invocation_result(invocation_id, response)
     print(f"RESPONSE: {response}", flush=True)
     return JSONResponse(response)
 
